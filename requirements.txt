@@ -1,7 +1,6 @@
 
-fastapi==0.115.12
-pypdf==5.4.0
-python-multipart==0.0.20
-requests
+fastapi
+uvicorn
+pypdf
+Pillow
 google-genai
-pypdfium2

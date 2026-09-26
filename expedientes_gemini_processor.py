@@ -5,66 +5,75 @@ import zipfile
 import concurrent.futures
 from google import genai
 from google.genai import types
-import pypdfium2 as pdfium
+from pypdf import PdfReader
+from PIL import Image
 
-# Inicializar cliente de Gemini (Lee GEMINI_API_KEY)
+# Inicializar cliente de Google Gen AI (Lee GEMINI_API_KEY)
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 
-def convertir_pdf_a_imagen_bytes(pdf_bytes: bytes) -> bytes:
-    """Convierte la primera página de un PDF escaneado a una imagen JPEG en memoria."""
+def extraer_imagen_de_pdf_escaneado(pdf_bytes: bytes) -> bytes:
+    """Extrae la imagen principal incrustada por la impresora en el PDF escaneado."""
     try:
-        pdf = pdfium.PdfDocument(pdf_bytes)
-        if len(pdf) == 0:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        if not reader.pages:
             return None
-        
-        # Renderizar la primera página a alta calidad (300 DPI aprox / scale 3)
-        page = pdf[0]
-        image = page.render(scale=3).to_pil()
-        
-        buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=90)
-        return buffer.getvalue()
+
+        primera_pagina = reader.pages[0]
+        images = primera_pagina.images
+
+        if images:
+            # Tomar la primera imagen que colocó el escáner
+            img_obj = images[0]
+            pil_img = Image.open(io.BytesIO(img_obj.data))
+
+            # Convertir a RGB si viene en CMYK o escala de grises
+            if pil_img.mode != "RGB":
+                pil_img = pil_img.convert("RGB")
+
+            buffer = io.BytesIO()
+            pil_img.save(buffer, format="JPEG", quality=85)
+            return buffer.getvalue()
     except Exception as e:
-        print(f"[ERROR CONVERSIÓN PDF A IMAGEN]: {e}")
-        return None
+        print(f"[ERROR EXTRACCIÓN IMAGEN PDF]: {e}")
+
+    return None
 
 
 def extraer_datos_con_gemini(contenido_bytes: bytes, filename: str) -> str:
-    """Convierte PDF a imagen si es necesario y procesa con Gemini Vision."""
-    
-    # 1. Si es PDF escaneado, lo convertimos a imagen JPEG
+    """Extrae imagen del PDF escaneado y consulta a Gemini."""
+
+    bytes_a_enviar = contenido_bytes
+    mime_type = "application/pdf"
+
+    # Si es PDF, intentamos extraer la imagen interna del escáner
     if filename.lower().endswith('.pdf'):
-        imagen_bytes = convertir_pdf_a_imagen_bytes(contenido_bytes)
-        if imagen_bytes:
-            bytes_a_enviar = imagen_bytes
+        img_bytes = extraer_imagen_de_pdf_escaneado(contenido_bytes)
+        if img_bytes:
+            bytes_a_enviar = img_bytes
             mime_type = "image/jpeg"
-        else:
-            bytes_a_enviar = contenido_bytes
-            mime_type = "application/pdf"
-    else:
-        bytes_a_enviar = contenido_bytes
-        mime_type = "image/jpeg" if filename.lower().endswith(('.jpg', '.jpeg')) else "image/png"
 
-    # 2. Prompt optimizado para documentos e impresos escaneados
     prompt = """
-    Analiza esta imagen escaneada de un expediente o control de ingreso/pesaje.
-    Extrae los siguientes datos:
-    1. FECHA (en formato YYYY-MM-DD).
-    2. NÚMERO DE ORDEN / TICKET / GUÍA (ejemplos: 1581_001, PV-2621425, 005542).
-    3. NOMBRE O SIGLA DEL CLIENTE (ejemplo: KANAY, SECHE, MAVER, etc.).
+    Analiza la imagen o documento de este expediente / hoja de pesaje / control de ingreso.
+    
+    Debes identificar 3 datos:
+    1. FECHA (Formato YYYY-MM-DD).
+    2. CÓDIGO / NÚMERO DE ORDEN / TICKET (Ejemplos: 1581_001, PV-2621425, ORD-123).
+    3. CLIENTE o EMPRESA (Ejemplo: SECHE, KANAY, MAVER, etc.).
 
-    Responde ÚNICAMENTE en una sola línea con el siguiente formato:
-    FECHA_CLIENTE_ORDEN
+    Responde ÚNICAMENTE los 3 datos separados por guion bajo (_).
+    
+    FORMATO OBLIGATORIO DE RESPUESTA:
+    YYYY-MM-DD_CLIENTE_ORDEN
 
-    Ejemplo de respuesta válida:
-    2026-09-24_KANAY_1581_001
+    Ejemplo de respuesta:
+    2026-09-25_SECHE_1593_020
 
-    Si no identificas un dato, reemplázalo por la palabra OTRO.
-    NO agregues saludos, explicaciones ni caracteres adicionales.
+    Si no encuentras un dato, coloca DESCONOCIDO. No agregues texto explicativo ni saludos.
     """
 
     try:
+        # Llamada a Gemini 1.5 Flash
         response = client.models.generate_content(
             model='gemini-1.5-flash',
             contents=[
@@ -72,35 +81,36 @@ def extraer_datos_con_gemini(contenido_bytes: bytes, filename: str) -> str:
                 prompt
             ]
         )
-        
-        texto_raw = response.text.strip() if response.text else ""
-        
-        # Tomar solo la primera línea y limpiar caracteres no permitidos en nombres de archivo
+
+        texto_raw = response.text.strip() if response and response.text else ""
+        print(f"[RESPUESTA GEMINI EN RAW]: {texto_raw}")
+
+        # Limpiar respuesta
         linea_unica = texto_raw.split('\n')[0].strip()
         resultado_limpio = re.sub(r'[^A-Za-z0-9_-]', '', linea_unica)
 
-        if resultado_limpio and len(resultado_limpio) > 5:
+        if resultado_limpio and "DESCONOCIDO" not in resultado_limpio and len(resultado_limpio) > 8:
             return resultado_limpio
 
     except Exception as e:
-        print(f"[ERROR GEMINI VISION]: {e}")
+        print(f"[ERROR LLAMADA GEMINI]: {e}")
 
     return None
 
 
 def procesar_un_archivo_gemini(args) -> tuple[str, bytes]:
     filename, pdf_or_img_bytes = args
-    
+
     nombre_extraido = extraer_datos_con_gemini(pdf_or_img_bytes, filename)
     ext = os.path.splitext(filename)[1].lower() or ".pdf"
-    
+
     if nombre_extraido:
         nuevo_nombre = f"{nombre_extraido}{ext}"
     else:
-        # Si no se pudo leer nada, mantenemos el nombre original con prefijo
+        # Mantiene el nombre si no logra extraer los 3 campos completos
         nombre_base = os.path.splitext(filename)[0]
-        nuevo_nombre = f"escaneo_{nombre_base}{ext}"
-        
+        nuevo_nombre = f"sin_extraer_{nombre_base}{ext}"
+
     return nuevo_nombre, pdf_or_img_bytes
 
 
@@ -111,8 +121,7 @@ def procesar_expedientes_gemini_masivo(archivos_subidos: list) -> tuple[dict, by
     nombres_existentes = set()
     renombrados = 0
 
-    # Ejecutar máximo 4 en paralelo para no saturar límites
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         resultados = list(executor.map(procesar_un_archivo_gemini, lista_tareas))
 
     with zipfile.ZipFile(zip_buffer_salida, "w", zipfile.ZIP_DEFLATED) as zip_salida:
@@ -120,11 +129,11 @@ def procesar_expedientes_gemini_masivo(archivos_subidos: list) -> tuple[dict, by
             base, ext = os.path.splitext(nuevo_nombre)
             contador = 1
             nombre_final = nuevo_nombre
-            
+
             while nombre_final in nombres_existentes:
                 nombre_final = f"{base}_{contador}{ext}"
                 contador += 1
-                
+
             nombres_existentes.add(nombre_final)
             zip_salida.writestr(nombre_final, bytes_archivo)
             renombrados += 1
