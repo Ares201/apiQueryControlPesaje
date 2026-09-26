@@ -46,7 +46,6 @@ def extraer_datos_con_gemini(contenido_bytes: bytes, filename: str) -> str:
     bytes_a_enviar = contenido_bytes
     mime_type = "application/pdf"
 
-    # Si es PDF, intentamos extraer la imagen interna del escáner
     if filename.lower().endswith('.pdf'):
         img_bytes = extraer_imagen_de_pdf_escaneado(contenido_bytes)
         if img_bytes:
@@ -54,26 +53,26 @@ def extraer_datos_con_gemini(contenido_bytes: bytes, filename: str) -> str:
             mime_type = "image/jpeg"
 
     prompt = """
-    Analiza la imagen o documento de este expediente / hoja de pesaje / control de ingreso.
+    Analiza esta hoja de control/pesaje/expediente escaneado.
     
-    Debes identificar 3 datos:
-    1. FECHA (Formato YYYY-MM-DD).
-    2. CÓDIGO / NÚMERO DE ORDEN / TICKET (Ejemplos: 1581_001, PV-2621425, ORD-123).
-    3. CLIENTE o EMPRESA (Ejemplo: SECHE, KANAY, MAVER, etc.).
+    Busca los siguientes 3 campos:
+    1. FECHA: Formato YYYY-MM-DD
+    2. CLIENTE: Nombre de la empresa (Ejemplo: SECHE, KANAY, MAVER, etc. Si no es claro o no está, escribe OTRO).
+    3. ORDEN/TICKET: Número de orden o ticket (Ejemplo: 1581_001, 1582_001, PV-2621425).
 
-    Responde ÚNICAMENTE los 3 datos separados por guion bajo (_).
+    Responde ÚNICAMENTE con los datos unidos por guion bajo (_).
     
-    FORMATO OBLIGATORIO DE RESPUESTA:
+    FORMATO OBLIGATORIO:
     YYYY-MM-DD_CLIENTE_ORDEN
 
-    Ejemplo de respuesta:
-    2026-09-25_SECHE_1593_020
+    Ejemplos válidos:
+    2026-09-24_OTRO_1581_001
+    2026-09-24_SECHE_1582_001
 
-    Si no encuentras un dato, coloca DESCONOCIDO. No agregues texto explicativo ni saludos.
+    No agregues introducciones, markdown, ni texto adicional.
     """
 
     try:
-        # Llamada a Gemini 1.5 Flash
         response = client.models.generate_content(
             model='gemini-1.5-flash',
             contents=[
@@ -83,21 +82,23 @@ def extraer_datos_con_gemini(contenido_bytes: bytes, filename: str) -> str:
         )
 
         texto_raw = response.text.strip() if response and response.text else ""
-        print(f"[RESPUESTA GEMINI EN RAW]: {texto_raw}")
+        print(f"[RESPUESTA GEMINI RAW]: {texto_raw}")
 
-        # Limpiar respuesta
-        linea_unica = texto_raw.split('\n')[0].strip()
-        resultado_limpio = re.sub(r'[^A-Za-z0-9_-]', '', linea_unica)
+        # Tomamos la primera línea limpia
+        linea = texto_raw.split('\n')[0].strip()
+        # Permitimos letras, números, guiones y guion bajo
+        resultado_limpio = re.sub(r'[^A-Za-z0-9_-]', '', linea)
 
-        if resultado_limpio and "DESCONOCIDO" not in resultado_limpio and len(resultado_limpio) > 8:
+        # Si tiene al menos una fecha o formato válido (ej. longitud mayor a 10)
+        if len(resultado_limpio) >= 10:
+            # Reemplazar cualquier residuo de DESCONOCIDO por OTRO
+            resultado_limpio = resultado_limpio.replace("DESCONOCIDO", "OTRO")
             return resultado_limpio
 
     except Exception as e:
-        print(f"[ERROR LLAMADA GEMINI]: {e}")
+        print(f"[ERROR GEMINI]: {e}")
 
     return None
-
-
 def procesar_un_archivo_gemini(args) -> tuple[str, bytes]:
     filename, pdf_or_img_bytes = args
 
