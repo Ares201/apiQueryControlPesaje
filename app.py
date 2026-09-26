@@ -7,11 +7,11 @@ from pathlib import Path
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from starlette.concurrency import run_in_threadpool
 
 from boletas_processor import procesar_boletas_pdf_en_memoria
 from expedientes_processor import procesar_expedientes_en_memoria  # Respaldo original
-from expedientes_gemini_processor import procesar_expedientes_gemini_masivo  # Motor Gemini
-from certificados_processor import procesar_certificados_pdf_en_memoria  # NUEVO
+from certificados_procesor import procesar_certificados_pdf_en_memoria
 
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", "50")) * 1024 * 1024  # 50MB
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv("ALLOWED_ORIGINS", "*").split(",") if x.strip()]
@@ -28,7 +28,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else ["*"],
-    allow_credentials=False if ALLOWED_ORIGINS == ["*"] else True,
+    allow_credentials="*" not in ALLOWED_ORIGINS,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["Content-Disposition", "X-Archivos-Procesados"],
@@ -40,17 +40,23 @@ app.add_middleware(
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     print(f"[ERROR NO CONTROLADO 500]: {exc}")
+    origin = request.headers.get("origin")
+    cors_headers = {}
+    if origin and "*" in ALLOWED_ORIGINS:
+        cors_headers["Access-Control-Allow-Origin"] = "*"
+    elif origin and origin in ALLOWED_ORIGINS:
+        cors_headers = {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Vary": "Origin",
+        }
     return JSONResponse(
         status_code=500,
         content={
             "success": False,
-            "detail": f"Error interno en el servidor: {str(exc)}"
+            "detail": "Error interno en el servidor"
         },
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Allow-Methods": "*"
-        }
+        headers=cors_headers,
     )
 
 @app.get("/")
@@ -109,6 +115,10 @@ async def procesar_expedientes(files: list[UploadFile] = File(...)):
     Recibe múltiples archivos PDF o imágenes (hasta 50 en un solo envío),
     los analiza con Gemini 1.5 Flash en paralelo y devuelve un ZIP renombrado.
     """
+    if not os.getenv("GEMINI_API_KEY"):
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY no está configurada")
+    from expedientes_gemini_processor import procesar_expedientes_gemini_masivo
+
     if not files:
         raise HTTPException(status_code=400, detail="No se enviaron archivos")
 
@@ -160,17 +170,17 @@ async def procesar_certificados(files: list[UploadFile] = File(...)):
     for file in files:
         filename = Path(file.filename or "certificado.pdf").name
         if not filename.lower().endswith(".pdf"):
-            continue
+            raise HTTPException(status_code=400, detail=f"{filename} debe ser un PDF")
 
         contenido = await file.read(MAX_FILE_SIZE + 1)
         await file.close()
 
         if not contenido:
-            continue
+            raise HTTPException(status_code=400, detail=f"{filename} está vacío")
         if len(contenido) > MAX_FILE_SIZE:
             raise HTTPException(status_code=413, detail=f"{filename} supera el límite permitido")
         if not contenido.startswith(b"%PDF-"):
-            continue
+            raise HTTPException(status_code=400, detail=f"{filename} no es un PDF válido")
 
         archivos_preparados.append((filename, contenido))
 
@@ -178,7 +188,15 @@ async def procesar_certificados(files: list[UploadFile] = File(...)):
         raise HTTPException(status_code=400, detail="No hay PDFs válidos para procesar")
 
     # Procesar en RAM
-    resultado, archivos_pdf = procesar_certificados_pdf_en_memoria(archivos_preparados)
+    resultado, archivos_pdf = await run_in_threadpool(
+        procesar_certificados_pdf_en_memoria, archivos_preparados
+    )
+
+    if resultado["errores"]:
+        raise HTTPException(
+            status_code=422,
+            detail="No se pudieron leer todos los certificados: " + "; ".join(resultado["errores"]),
+        )
 
     if not resultado["success"]:
         raise HTTPException(status_code=422, detail=resultado["mensaje"])

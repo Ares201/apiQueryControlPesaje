@@ -5,3 +5,4 @@ python-multipart==0.0.20
 requests
 google-genai
 uvicorn
+python-dotenv

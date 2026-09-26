@@ -86,7 +86,7 @@ def procesar_certificados_pdf_en_memoria(archivos):
         for nombre_original, contenido in archivos:
             try:
                 reader = PdfReader(io.BytesIO(contenido))
-                texto = "".join((p.extract_text() or "") for p in reader.pages)
+                texto = "\n".join((p.extract_text() or "") for p in reader.pages)
 
                 datos = _extraer_datos_certificado(texto)
 
