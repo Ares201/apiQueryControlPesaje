@@ -4,30 +4,53 @@ import os
 import zipfile
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
 from boletas_processor import procesar_boletas_pdf_en_memoria
 from expedientes_processor import procesar_expedientes_en_memoria  # Respaldo original
-from expedientes_gemini_processor import procesar_expedientes_gemini_masivo  # Nuevo motor Gemini
+from expedientes_gemini_processor import procesar_expedientes_gemini_masivo  # Motor Gemini
 
-MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", "50")) * 1024 * 1024  # Aumentado a 50MB para lotes
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", "50")) * 1024 * 1024  # 50MB
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv("ALLOWED_ORIGINS", "*").split(",") if x.strip()]
 
 app = FastAPI(
     title="API de Procesamiento de Boletas y Expedientes",
-    description="Procesa, separa y renombra boletas PDF y expedientes escaneados.",
+    description="Procesa, separa y renombra boletas PDF y expedientes escaneados con Gemini 1.5 Flash.",
     version="1.0.0",
 )
 
+# ==============================================================================
+# CONFIGURACIÓN DE CORS
+# ==============================================================================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=ALLOWED_ORIGINS != ["*"],
+    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else ["*"],
+    allow_credentials=False if ALLOWED_ORIGINS == ["*"] else True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition", "X-Archivos-Procesados"],
 )
+
+# ==============================================================================
+# CAPTURADOR GLOBAL DE EXCEPCIONES (Previene bloqueos CORS en errores 500)
+# ==============================================================================
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    print(f"[ERROR NO CONTROLADO 500]: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "detail": f"Error interno en el servidor: {str(exc)}"
+        },
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Methods": "*"
+        }
+    )
 
 @app.get("/")
 @app.get("/api/health")
@@ -47,7 +70,7 @@ async def procesar_boletas(file: UploadFile = File(...)):
     if not contenido:
         raise HTTPException(status_code=400, detail="El archivo está vacío")
     if len(contenido) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail=f"El archivo supera el límite permitidos")
+        raise HTTPException(status_code=413, detail="El archivo supera el límite permitido")
     if not contenido.startswith(b"%PDF-"):
         raise HTTPException(status_code=400, detail="El contenido no es un PDF válido")
 
@@ -77,7 +100,7 @@ async def procesar_boletas(file: UploadFile = File(...)):
     )
 
 # ==============================================================================
-# NUEVO ENDPOINT MASIVO PARA EXPEDIENTES USANDO GEMINI (HASTA 50 ARCHIVOS)
+# ENDPOINT MASIVO PARA EXPEDIENTES CON GEMINI (HASTA 50 ARCHIVOS)
 # ==============================================================================
 @app.post("/api/procesar-expedientes")
 async def procesar_expedientes(files: list[UploadFile] = File(...)):
